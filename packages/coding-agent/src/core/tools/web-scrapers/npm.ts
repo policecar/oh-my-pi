@@ -47,7 +47,7 @@ export const handleNpm: SpecialHandler = async (url: string, timeout: number): P
 			name: string;
 			version: string;
 			description?: string;
-			license?: string;
+			license?: string | { type: string };
 			homepage?: string;
 			repository?: { url: string } | string;
 			keywords?: string[];
@@ -66,7 +66,10 @@ export const handleNpm: SpecialHandler = async (url: string, timeout: number): P
 		if (pkg.description) md += `${pkg.description}\n\n`;
 
 		md += `**Latest:** ${pkg.version || "unknown"}`;
-		if (pkg.license) md += ` · **License:** ${typeof pkg.license === "string" ? pkg.license : pkg.license}`;
+		if (pkg.license) {
+			const license = typeof pkg.license === "string" ? pkg.license : (pkg.license.type ?? String(pkg.license));
+			md += ` · **License:** ${license}`;
+		}
 		md += "\n";
 		if (weeklyDownloads !== null) {
 			md += `**Weekly Downloads:** ${formatCount(weeklyDownloads)}\n`;

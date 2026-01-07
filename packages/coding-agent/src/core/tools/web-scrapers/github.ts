@@ -64,7 +64,7 @@ function parseGitHubUrl(url: string): GitHubUrl | null {
  * Convert GitHub blob URL to raw URL
  */
 function toRawGitHubUrl(gh: GitHubUrl): string {
-	return `https://raw.githubusercontent.com/${gh.owner}/${gh.repo}/refs/heads/${gh.ref}/${gh.path}`;
+	return `https://raw.githubusercontent.com/${gh.owner}/${gh.repo}/${gh.ref}/${gh.path}`;
 }
 
 /**
@@ -72,8 +72,7 @@ function toRawGitHubUrl(gh: GitHubUrl): string {
  */
 export async function fetchGitHubApi(endpoint: string, timeout: number): Promise<{ data: unknown; ok: boolean }> {
 	try {
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), timeout * 1000);
+		const timeoutSignal = AbortSignal.timeout(timeout * 1000);
 
 		const headers: Record<string, string> = {
 			Accept: "application/vnd.github.v3+json",
@@ -87,11 +86,9 @@ export async function fetchGitHubApi(endpoint: string, timeout: number): Promise
 		}
 
 		const response = await fetch(`https://api.github.com${endpoint}`, {
-			signal: controller.signal,
+			signal: timeoutSignal,
 			headers,
 		});
-
-		clearTimeout(timeoutId);
 
 		if (!response.ok) {
 			return { data: null, ok: false };
@@ -240,7 +237,7 @@ async function renderGitHubTree(gh: GitHubUrl, timeout: number): Promise<{ conte
 		const readmeFile = items.find((item) => item.type === "file" && /^readme\.md$/i.test(item.name));
 		if (readmeFile) {
 			const readmePath = dirPath ? `${dirPath}/${readmeFile.name}` : readmeFile.name;
-			const rawUrl = `https://raw.githubusercontent.com/${gh.owner}/${gh.repo}/refs/heads/${ref}/${readmePath}`;
+			const rawUrl = `https://raw.githubusercontent.com/${gh.owner}/${gh.repo}/${ref}/${readmePath}`;
 			const readmeResult = await loadPage(rawUrl, { timeout });
 			if (readmeResult.ok) {
 				md += `---\n\n## README\n\n${readmeResult.content}`;

@@ -16,6 +16,61 @@ export interface RenderResult {
 export type SpecialHandler = (url: string, timeout: number) => Promise<RenderResult | null>;
 
 export const MAX_OUTPUT_CHARS = 500_000;
+const MAX_BYTES = 50 * 1024 * 1024;
+
+const USER_AGENTS = [
+	"curl/8.0",
+	"Mozilla/5.0 (compatible; TextBot/1.0)",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+];
+
+export interface RequestSignal {
+	signal: AbortSignal;
+	cleanup: () => void;
+}
+
+export function createRequestSignal(timeoutMs: number, signal?: AbortSignal): RequestSignal {
+	const controller = new AbortController();
+	let timeoutId: ReturnType<typeof setTimeout> | undefined = setTimeout(() => controller.abort(), timeoutMs);
+	const abortHandler = () => controller.abort();
+
+	if (signal) {
+		if (signal.aborted) {
+			clearTimeout(timeoutId);
+			timeoutId = undefined;
+			controller.abort();
+		} else {
+			signal.addEventListener("abort", abortHandler, { once: true });
+		}
+	}
+
+	const cleanup = () => {
+		if (timeoutId !== undefined) {
+			clearTimeout(timeoutId);
+			timeoutId = undefined;
+		}
+		if (signal) {
+			signal.removeEventListener("abort", abortHandler);
+		}
+	};
+
+	return { signal: controller.signal, cleanup };
+}
+
+function isBotBlocked(status: number, content: string): boolean {
+	if (status === 403 || status === 503) {
+		const lower = content.toLowerCase();
+		return (
+			lower.includes("cloudflare") ||
+			lower.includes("captcha") ||
+			lower.includes("challenge") ||
+			lower.includes("blocked") ||
+			lower.includes("access denied") ||
+			lower.includes("bot detection")
+		);
+	}
+	return false;
+}
 
 /**
  * Truncate and cleanup output
@@ -29,30 +84,41 @@ export function finalizeOutput(content: string): { content: string; truncated: b
 	};
 }
 
+export interface LoadPageOptions {
+	timeout?: number;
+	headers?: Record<string, string>;
+	method?: string;
+	body?: string;
+	maxBytes?: number;
+	signal?: AbortSignal;
+}
+
+export interface LoadPageResult {
+	content: string;
+	contentType: string;
+	finalUrl: string;
+	ok: boolean;
+	status?: number;
+}
+
 /**
  * Fetch a page with timeout and size limit
  */
-export async function loadPage(
-	url: string,
-	options: { timeout?: number; headers?: Record<string, string>; maxBytes?: number } = {},
-): Promise<{ content: string; contentType: string; finalUrl: string; ok: boolean; status?: number }> {
-	const { timeout = 20, headers = {}, maxBytes = 50 * 1024 * 1024 } = options;
+export async function loadPage(url: string, options: LoadPageOptions = {}): Promise<LoadPageResult> {
+	const { timeout = 20, headers = {}, maxBytes = MAX_BYTES, signal, method = "GET", body } = options;
 
-	const userAgents = [
-		"curl/8.0",
-		"Mozilla/5.0 (compatible; TextBot/1.0)",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-	];
+	for (let attempt = 0; attempt < USER_AGENTS.length; attempt++) {
+		if (signal?.aborted) {
+			return { content: "", contentType: "", finalUrl: url, ok: false };
+		}
 
-	for (let attempt = 0; attempt < userAgents.length; attempt++) {
-		const userAgent = userAgents[attempt];
+		const userAgent = USER_AGENTS[attempt];
+		const { signal: requestSignal, cleanup } = createRequestSignal(timeout * 1000, signal);
 
 		try {
-			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), timeout * 1000);
-
-			const response = await fetch(url, {
-				signal: controller.signal,
+			const requestInit: RequestInit = {
+				signal: requestSignal,
+				method,
 				headers: {
 					"User-Agent": userAgent,
 					Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -60,9 +126,13 @@ export async function loadPage(
 					...headers,
 				},
 				redirect: "follow",
-			});
+			};
 
-			clearTimeout(timeoutId);
+			if (body !== undefined) {
+				requestInit.body = body;
+			}
+
+			const response = await fetch(url, requestInit);
 
 			const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
 			const finalUrl = response.url;
@@ -91,12 +161,8 @@ export async function loadPage(
 			const decoder = new TextDecoder();
 			const content = decoder.decode(Buffer.concat(chunks));
 
-			// Check if blocked
-			if ((response.status === 403 || response.status === 503) && attempt < userAgents.length - 1) {
-				const lower = content.toLowerCase();
-				if (lower.includes("cloudflare") || lower.includes("captcha") || lower.includes("blocked")) {
-					continue;
-				}
+			if (isBotBlocked(response.status, content) && attempt < USER_AGENTS.length - 1) {
+				continue;
 			}
 
 			if (!response.ok) {
@@ -105,9 +171,14 @@ export async function loadPage(
 
 			return { content, contentType, finalUrl, ok: true, status: response.status };
 		} catch (_err) {
-			if (attempt === userAgents.length - 1) {
+			if (signal?.aborted) {
 				return { content: "", contentType: "", finalUrl: url, ok: false };
 			}
+			if (attempt === USER_AGENTS.length - 1) {
+				return { content: "", contentType: "", finalUrl: url, ok: false };
+			}
+		} finally {
+			cleanup();
 		}
 	}
 

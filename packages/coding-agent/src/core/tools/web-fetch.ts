@@ -5,82 +5,17 @@ import { Type } from "@sinclair/typebox";
 import { parse as parseHtml } from "node-html-parser";
 import webFetchDescription from "../../prompts/tools/web-fetch.md" with { type: "text" };
 import { ensureTool } from "../../utils/tools-manager";
-import { logger } from "../logger";
 import type { ToolSession } from "./index";
-import {
-	handleArtifactHub,
-	handleArxiv,
-	handleAur,
-	handleBiorxiv,
-	handleBluesky,
-	handleBrew,
-	handleCheatSh,
-	handleChocolatey,
-	handleCoinGecko,
-	handleCratesIo,
-	handleDevTo,
-	handleDiscogs,
-	handleDockerHub,
-	handleGitHub,
-	handleGitHubGist,
-	handleGitLab,
-	handleGoPkg,
-	handleHackage,
-	handleHackerNews,
-	handleHex,
-	handleHuggingFace,
-	handleIacr,
-	handleLobsters,
-	handleMastodon,
-	handleMaven,
-	handleMDN,
-	handleMetaCPAN,
-	handleNpm,
-	handleNuGet,
-	handleNvd,
-	handleOpenCorporates,
-	handleOpenLibrary,
-	handleOsv,
-	handlePackagist,
-	handlePubDev,
-	handlePubMed,
-	handlePyPI,
-	handleReadTheDocs,
-	handleReddit,
-	handleRepology,
-	handleRfc,
-	handleRubyGems,
-	handleSecEdgar,
-	handleSemanticScholar,
-	handleSpotify,
-	handleStackOverflow,
-	handleTerraform,
-	handleTldr,
-	handleTwitter,
-	handleVimeo,
-	handleWikidata,
-	handleWikipedia,
-	handleYouTube,
-} from "./web-fetch-handlers/index";
+import { specialHandlers } from "./web-scrapers/index";
+import type { RenderResult } from "./web-scrapers/types";
+import { finalizeOutput, loadPage } from "./web-scrapers/types";
+import { convertWithMarkitdown, fetchBinary } from "./web-scrapers/utils";
 
 // =============================================================================
 // Types and Constants
 // =============================================================================
 
-interface RenderResult {
-	url: string;
-	finalUrl: string;
-	contentType: string;
-	method: string;
-	content: string;
-	fetchedAt: string;
-	truncated: boolean;
-	notes: string[];
-}
-
 const DEFAULT_TIMEOUT = 20;
-const MAX_BYTES = 50 * 1024 * 1024; // 50MB for binary files
-const MAX_OUTPUT_CHARS = 500_000;
 
 // Convertible document types (markitdown supported)
 const CONVERTIBLE_MIMES = new Set([
@@ -123,124 +58,11 @@ const CONVERTIBLE_EXTENSIONS = new Set([
 	".ogg",
 ]);
 
-const USER_AGENTS = [
-	"curl/8.0",
-	"Mozilla/5.0 (compatible; TextBot/1.0)",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-];
-
 // =============================================================================
 // Utilities
 // =============================================================================
 
-interface LoadPageResult {
-	content: string;
-	contentType: string;
-	finalUrl: string;
-	ok: boolean;
-	status?: number;
-}
-
-interface LoadPageOptions {
-	timeout?: number;
-	headers?: Record<string, string>;
-	maxBytes?: number;
-}
-
-/**
- * Check if response indicates bot blocking (Cloudflare, etc.)
- */
-function isBotBlocked(status: number, content: string): boolean {
-	if (status === 403 || status === 503) {
-		const lower = content.toLowerCase();
-		return (
-			lower.includes("cloudflare") ||
-			lower.includes("captcha") ||
-			lower.includes("challenge") ||
-			lower.includes("blocked") ||
-			lower.includes("access denied") ||
-			lower.includes("bot detection")
-		);
-	}
-	return false;
-}
-
-/**
- * Fetch a page with timeout, size limit, and automatic retry with browser UA if blocked
- */
-async function loadPage(url: string, options: LoadPageOptions = {}): Promise<LoadPageResult> {
-	const { timeout = 20, headers = {}, maxBytes = MAX_BYTES } = options;
-
-	for (let attempt = 0; attempt < USER_AGENTS.length; attempt++) {
-		const userAgent = USER_AGENTS[attempt];
-
-		try {
-			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), timeout * 1000);
-
-			const response = await fetch(url, {
-				signal: controller.signal,
-				headers: {
-					"User-Agent": userAgent,
-					Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-					"Accept-Language": "en-US,en;q=0.5",
-					...headers,
-				},
-				redirect: "follow",
-			});
-
-			clearTimeout(timeoutId);
-
-			const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
-			const finalUrl = response.url;
-
-			// Read with size limit
-			const reader = response.body?.getReader();
-			if (!reader) {
-				return { content: "", contentType, finalUrl, ok: false, status: response.status };
-			}
-
-			const chunks: Uint8Array[] = [];
-			let totalSize = 0;
-
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-
-				chunks.push(value);
-				totalSize += value.length;
-
-				if (totalSize > maxBytes) {
-					reader.cancel();
-					break;
-				}
-			}
-
-			const decoder = new TextDecoder();
-			const content = decoder.decode(Buffer.concat(chunks));
-
-			// Check if we got blocked and should retry with browser UA
-			if (isBotBlocked(response.status, content) && attempt < USER_AGENTS.length - 1) {
-				continue;
-			}
-
-			if (!response.ok) {
-				return { content, contentType, finalUrl, ok: false, status: response.status };
-			}
-
-			return { content, contentType, finalUrl, ok: true, status: response.status };
-		} catch (err) {
-			// On last attempt, return failure
-			if (attempt === USER_AGENTS.length - 1) {
-				logger.debug("Web fetch failed after retries", { url, error: String(err) });
-				return { content: "", contentType: "", finalUrl: url, ok: false };
-			}
-			// Otherwise retry with next UA
-		}
-	}
-
-	return { content: "", contentType: "", finalUrl: url, ok: false };
-}
+type SpawnSyncOptions = NonNullable<Parameters<typeof Bun.spawnSync>[1]>;
 
 /**
  * Execute a command and return stdout
@@ -250,8 +72,9 @@ function exec(
 	args: string[],
 	options?: { timeout?: number; input?: string | Buffer },
 ): { stdout: string; stderr: string; ok: boolean } {
+	const stdin = (options?.input ?? "ignore") as SpawnSyncOptions["stdin"];
 	const result = Bun.spawnSync([cmd, ...args], {
-		stdin: options?.input ? (options.input as any) : "ignore",
+		stdin,
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -345,38 +168,9 @@ function looksLikeHtml(content: string): boolean {
 }
 
 /**
- * Convert binary file to markdown using markitdown
- */
-async function convertWithMarkitdown(
-	content: Buffer,
-	extensionHint: string,
-	timeout: number,
-): Promise<{ content: string; ok: boolean }> {
-	const markitdown = await ensureTool("markitdown", true);
-	if (!markitdown) {
-		return { content: "", ok: false };
-	}
-
-	// Write to temp file with extension hint
-	const ext = extensionHint || ".bin";
-	const tmpDir = tmpdir();
-	const tmpFile = path.join(tmpDir, `omp-convert-${Date.now()}${ext}`);
-
-	try {
-		await Bun.write(tmpFile, content);
-		const result = exec(markitdown, [tmpFile], { timeout });
-		return { content: result.stdout, ok: result.ok };
-	} finally {
-		try {
-			await Bun.$`rm ${tmpFile}`.quiet();
-		} catch {}
-	}
-}
-
-/**
  * Try fetching URL with .md appended (llms.txt convention)
  */
-async function tryMdSuffix(url: string, timeout: number): Promise<string | null> {
+async function tryMdSuffix(url: string, timeout: number, signal?: AbortSignal): Promise<string | null> {
 	const candidates: string[] = [];
 
 	try {
@@ -397,8 +191,15 @@ async function tryMdSuffix(url: string, timeout: number): Promise<string | null>
 		return null;
 	}
 
+	if (signal?.aborted) {
+		return null;
+	}
+
 	for (const candidate of candidates) {
-		const result = await loadPage(candidate, { timeout: Math.min(timeout, 5) });
+		if (signal?.aborted) {
+			return null;
+		}
+		const result = await loadPage(candidate, { timeout: Math.min(timeout, 5), signal });
 		if (result.ok && result.content.trim().length > 100 && !looksLikeHtml(result.content)) {
 			return result.content;
 		}
@@ -410,11 +211,18 @@ async function tryMdSuffix(url: string, timeout: number): Promise<string | null>
 /**
  * Try to fetch LLM-friendly endpoints
  */
-async function tryLlmEndpoints(origin: string, timeout: number): Promise<string | null> {
+async function tryLlmEndpoints(origin: string, timeout: number, signal?: AbortSignal): Promise<string | null> {
 	const endpoints = [`${origin}/.well-known/llms.txt`, `${origin}/llms.txt`, `${origin}/llms.md`];
 
+	if (signal?.aborted) {
+		return null;
+	}
+
 	for (const endpoint of endpoints) {
-		const result = await loadPage(endpoint, { timeout: Math.min(timeout, 5) });
+		if (signal?.aborted) {
+			return null;
+		}
+		const result = await loadPage(endpoint, { timeout: Math.min(timeout, 5), signal });
 		if (result.ok && result.content.trim().length > 100 && !looksLikeHtml(result.content)) {
 			return result.content;
 		}
@@ -425,10 +233,19 @@ async function tryLlmEndpoints(origin: string, timeout: number): Promise<string 
 /**
  * Try content negotiation for markdown/plain
  */
-async function tryContentNegotiation(url: string, timeout: number): Promise<{ content: string; type: string } | null> {
+async function tryContentNegotiation(
+	url: string,
+	timeout: number,
+	signal?: AbortSignal,
+): Promise<{ content: string; type: string } | null> {
+	if (signal?.aborted) {
+		return null;
+	}
+
 	const result = await loadPage(url, {
 		timeout,
 		headers: { Accept: "text/markdown, text/plain;q=0.9, text/html;q=0.8" },
+		signal,
 	});
 
 	if (!result.ok) return null;
@@ -658,64 +475,6 @@ function formatJson(content: string): string {
 	}
 }
 
-/**
- * Truncate and cleanup output
- */
-function finalizeOutput(content: string): { content: string; truncated: boolean } {
-	const cleaned = content.replace(/\n{3,}/g, "\n\n").trim();
-	const truncated = cleaned.length > MAX_OUTPUT_CHARS;
-	return {
-		content: cleaned.slice(0, MAX_OUTPUT_CHARS),
-		truncated,
-	};
-}
-
-/**
- * Fetch page as binary buffer (for convertible files)
- */
-async function fetchBinary(
-	url: string,
-	timeout: number,
-): Promise<{ buffer: Buffer; contentType: string; contentDisposition?: string; ok: boolean }> {
-	try {
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), timeout * 1000);
-
-		const response = await fetch(url, {
-			signal: controller.signal,
-			headers: {
-				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0",
-			},
-			redirect: "follow",
-		});
-
-		clearTimeout(timeoutId);
-
-		if (!response.ok) {
-			return { buffer: Buffer.alloc(0), contentType: "", ok: false };
-		}
-
-		const contentType = response.headers.get("content-type") ?? "";
-		const contentDisposition = response.headers.get("content-disposition") ?? undefined;
-		const contentLength = response.headers.get("content-length");
-		if (contentLength) {
-			const size = Number.parseInt(contentLength, 10);
-			if (Number.isFinite(size) && size > MAX_BYTES) {
-				return { buffer: Buffer.alloc(0), contentType, contentDisposition, ok: false };
-			}
-		}
-
-		const buffer = Buffer.from(await response.arrayBuffer());
-		if (buffer.length > MAX_BYTES) {
-			return { buffer: Buffer.alloc(0), contentType, contentDisposition, ok: false };
-		}
-
-		return { buffer, contentType, contentDisposition, ok: true };
-	} catch {
-		return { buffer: Buffer.alloc(0), contentType: "", ok: false };
-	}
-}
-
 // =============================================================================
 // Unified Special Handler Dispatch
 // =============================================================================
@@ -723,74 +482,15 @@ async function fetchBinary(
 /**
  * Try all special handlers
  */
-async function handleSpecialUrls(url: string, timeout: number): Promise<RenderResult | null> {
-	// Order matters - more specific first
-	return (
-		// Git hosting
-		(await handleGitHubGist(url, timeout)) ||
-		(await handleGitHub(url, timeout)) ||
-		(await handleGitLab(url, timeout)) ||
-		// Video/Media
-		(await handleYouTube(url, timeout)) ||
-		(await handleVimeo(url, timeout)) ||
-		(await handleSpotify(url, timeout)) ||
-		(await handleDiscogs(url, timeout)) ||
-		// Social/News
-		(await handleTwitter(url, timeout)) ||
-		(await handleBluesky(url, timeout)) ||
-		(await handleMastodon(url, timeout)) ||
-		(await handleHackerNews(url, timeout)) ||
-		(await handleLobsters(url, timeout)) ||
-		(await handleReddit(url, timeout)) ||
-		// Developer content
-		(await handleStackOverflow(url, timeout)) ||
-		(await handleDevTo(url, timeout)) ||
-		(await handleMDN(url, timeout)) ||
-		(await handleReadTheDocs(url, timeout)) ||
-		(await handleTldr(url, timeout)) ||
-		(await handleCheatSh(url, timeout)) ||
-		// Package registries
-		(await handleNpm(url, timeout)) ||
-		(await handleNuGet(url, timeout)) ||
-		(await handleChocolatey(url, timeout)) ||
-		(await handleBrew(url, timeout)) ||
-		(await handlePyPI(url, timeout)) ||
-		(await handleCratesIo(url, timeout)) ||
-		(await handleDockerHub(url, timeout)) ||
-		(await handleGoPkg(url, timeout)) ||
-		(await handleHex(url, timeout)) ||
-		(await handlePackagist(url, timeout)) ||
-		(await handlePubDev(url, timeout)) ||
-		(await handleMaven(url, timeout)) ||
-		(await handleArtifactHub(url, timeout)) ||
-		(await handleRubyGems(url, timeout)) ||
-		(await handleTerraform(url, timeout)) ||
-		(await handleAur(url, timeout)) ||
-		(await handleHackage(url, timeout)) ||
-		(await handleMetaCPAN(url, timeout)) ||
-		(await handleRepology(url, timeout)) ||
-		// ML/AI
-		(await handleHuggingFace(url, timeout)) ||
-		// Academic
-		(await handleArxiv(url, timeout)) ||
-		(await handleBiorxiv(url, timeout)) ||
-		(await handleIacr(url, timeout)) ||
-		(await handleSemanticScholar(url, timeout)) ||
-		(await handlePubMed(url, timeout)) ||
-		(await handleRfc(url, timeout)) ||
-		// Security
-		(await handleNvd(url, timeout)) ||
-		(await handleOsv(url, timeout)) ||
-		// Crypto
-		(await handleCoinGecko(url, timeout)) ||
-		// Business
-		(await handleOpenCorporates(url, timeout)) ||
-		(await handleSecEdgar(url, timeout)) ||
-		// Reference
-		(await handleOpenLibrary(url, timeout)) ||
-		(await handleWikidata(url, timeout)) ||
-		(await handleWikipedia(url, timeout))
-	);
+async function handleSpecialUrls(url: string, timeout: number, signal?: AbortSignal): Promise<RenderResult | null> {
+	for (const handler of specialHandlers) {
+		if (signal?.aborted) {
+			throw new Error("Operation aborted");
+		}
+		const result = await handler(url, timeout);
+		if (result) return result;
+	}
+	return null;
 }
 
 // =============================================================================
@@ -800,9 +500,17 @@ async function handleSpecialUrls(url: string, timeout: number): Promise<RenderRe
 /**
  * Main render function implementing the full pipeline
  */
-async function renderUrl(url: string, timeout: number, raw: boolean = false): Promise<RenderResult> {
+async function renderUrl(
+	url: string,
+	timeout: number,
+	raw: boolean = false,
+	signal?: AbortSignal,
+): Promise<RenderResult> {
 	const notes: string[] = [];
 	const fetchedAt = new Date().toISOString();
+	if (signal?.aborted) {
+		throw new Error("Operation aborted");
+	}
 
 	// Step 0: Normalize URL (ensure scheme for special handlers)
 	url = normalizeUrl(url);
@@ -810,12 +518,15 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 
 	// Step 1: Try special handlers for known sites (unless raw mode)
 	if (!raw) {
-		const specialResult = await handleSpecialUrls(url, timeout);
+		const specialResult = await handleSpecialUrls(url, timeout, signal);
 		if (specialResult) return specialResult;
 	}
 
 	// Step 2: Fetch page
-	const response = await loadPage(url, { timeout });
+	const response = await loadPage(url, { timeout, signal });
+	if (signal?.aborted) {
+		throw new Error("Operation aborted");
+	}
 	if (!response.ok) {
 		return {
 			url,
@@ -835,26 +546,36 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 
 	// Step 3: Handle convertible binary files (PDF, DOCX, etc.)
 	if (isConvertible(mime, extHint)) {
-		const binary = await fetchBinary(finalUrl, timeout);
+		const binary = await fetchBinary(finalUrl, timeout, signal);
 		if (binary.ok) {
 			const ext = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
-			const converted = await convertWithMarkitdown(binary.buffer, ext, timeout);
-			if (converted.ok && converted.content.trim().length > 50) {
-				notes.push(`Converted with markitdown`);
-				const output = finalizeOutput(converted.content);
-				return {
-					url,
-					finalUrl,
-					contentType: mime,
-					method: "markitdown",
-					content: output.content,
-					fetchedAt,
-					truncated: output.truncated,
-					notes,
-				};
+			const converted = await convertWithMarkitdown(binary.buffer, ext, timeout, signal);
+			if (converted.ok) {
+				if (converted.content.trim().length > 50) {
+					notes.push("Converted with markitdown");
+					const output = finalizeOutput(converted.content);
+					return {
+						url,
+						finalUrl,
+						contentType: mime,
+						method: "markitdown",
+						content: output.content,
+						fetchedAt,
+						truncated: output.truncated,
+						notes,
+					};
+				}
+				notes.push("markitdown conversion produced no usable output");
+			} else if (converted.error) {
+				notes.push(`markitdown conversion failed: ${converted.error}`);
+			} else {
+				notes.push("markitdown conversion failed");
 			}
+		} else if (binary.error) {
+			notes.push(`Binary fetch failed: ${binary.error}`);
+		} else {
+			notes.push("Binary fetch failed");
 		}
-		notes.push("markitdown conversion failed");
 	}
 
 	// Step 4: Handle non-HTML text content
@@ -914,7 +635,7 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 		const markdownAlt = alternates.find((alt) => alt.endsWith(".md") || alt.includes("markdown"));
 		if (markdownAlt) {
 			const resolved = markdownAlt.startsWith("http") ? markdownAlt : new URL(markdownAlt, finalUrl).href;
-			const altResult = await loadPage(resolved, { timeout });
+			const altResult = await loadPage(resolved, { timeout, signal });
 			if (altResult.ok && altResult.content.trim().length > 100 && !looksLikeHtml(altResult.content)) {
 				notes.push(`Used markdown alternate: ${resolved}`);
 				const output = finalizeOutput(altResult.content);
@@ -932,7 +653,7 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 		}
 
 		// 5B: Try URL.md suffix (llms.txt convention)
-		const mdSuffix = await tryMdSuffix(finalUrl, timeout);
+		const mdSuffix = await tryMdSuffix(finalUrl, timeout, signal);
 		if (mdSuffix) {
 			notes.push("Found .md suffix version");
 			const output = finalizeOutput(mdSuffix);
@@ -949,7 +670,7 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 		}
 
 		// 5C: LLM-friendly endpoints
-		const llmContent = await tryLlmEndpoints(origin, timeout);
+		const llmContent = await tryLlmEndpoints(origin, timeout, signal);
 		if (llmContent) {
 			notes.push("Found llms.txt");
 			const output = finalizeOutput(llmContent);
@@ -966,7 +687,7 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 		}
 
 		// 5D: Content negotiation
-		const negotiated = await tryContentNegotiation(url, timeout);
+		const negotiated = await tryContentNegotiation(url, timeout, signal);
 		if (negotiated) {
 			notes.push(`Content negotiation returned ${negotiated.type}`);
 			const output = finalizeOutput(negotiated.content);
@@ -986,7 +707,7 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 		const feedAlternates = alternates.filter((alt) => !alt.endsWith(".md") && !alt.includes("markdown"));
 		for (const altUrl of feedAlternates.slice(0, 2)) {
 			const resolved = altUrl.startsWith("http") ? altUrl : new URL(altUrl, finalUrl).href;
-			const altResult = await loadPage(resolved, { timeout });
+			const altResult = await loadPage(resolved, { timeout, signal });
 			if (altResult.ok && altResult.content.trim().length > 200) {
 				notes.push(`Used feed alternate: ${resolved}`);
 				const parsed = parseFeedToMarkdown(altResult.content);
@@ -1002,6 +723,10 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 					notes,
 				};
 			}
+		}
+
+		if (signal?.aborted) {
+			throw new Error("Operation aborted");
 		}
 
 		// Step 6: Render HTML with lynx or html2text
@@ -1026,10 +751,10 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 			const docLinks = extractDocumentLinks(rawContent, finalUrl);
 			if (docLinks.length > 0) {
 				const docUrl = docLinks[0];
-				const binary = await fetchBinary(docUrl, timeout);
+				const binary = await fetchBinary(docUrl, timeout, signal);
 				if (binary.ok) {
 					const ext = getExtensionHint(docUrl, binary.contentDisposition);
-					const converted = await convertWithMarkitdown(binary.buffer, ext, timeout);
+					const converted = await convertWithMarkitdown(binary.buffer, ext, timeout, signal);
 					if (converted.ok && converted.content.trim().length > htmlResult.content.length) {
 						notes.push(`Extracted and converted document: ${docUrl}`);
 						const output = finalizeOutput(converted.content);
@@ -1044,6 +769,11 @@ async function renderUrl(url: string, timeout: number, raw: boolean = false): Pr
 							notes,
 						};
 					}
+					if (!converted.ok && converted.error) {
+						notes.push(`markitdown conversion failed: ${converted.error}`);
+					}
+				} else if (binary.error) {
+					notes.push(`Binary fetch failed: ${binary.error}`);
 				}
 			}
 			notes.push("Page appears to require JavaScript or is mostly navigation");
@@ -1106,11 +836,16 @@ export function createWebFetchTool(_session: ToolSession): AgentTool<typeof webF
 		execute: async (
 			_toolCallId: string,
 			{ url, timeout = DEFAULT_TIMEOUT, raw = false }: { url: string; timeout?: number; raw?: boolean },
+			signal?: AbortSignal,
 		) => {
+			if (signal?.aborted) {
+				throw new Error("Operation aborted");
+			}
+
 			// Clamp timeout
 			const effectiveTimeout = Math.min(Math.max(timeout, 1), 120);
 
-			const result = await renderUrl(url, effectiveTimeout, raw);
+			const result = await renderUrl(url, effectiveTimeout, raw, signal);
 
 			// Format output
 			let output = "";

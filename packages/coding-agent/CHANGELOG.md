@@ -1,6 +1,23 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added 80+ specialized web scrapers for structured content extraction from popular sites including GitHub, GitLab, npm, PyPI, crates.io, Wikipedia, YouTube, Stack Overflow, Hacker News, Reddit, arXiv, PubMed, and many more
+- Added site-specific API integrations for package registries (npm, PyPI, crates.io, Hex, Hackage, NuGet, Maven, RubyGems, Packagist, pub.dev, Go packages)
+- Added scrapers for social platforms (Mastodon, Bluesky, Lemmy, Lobsters, Dev.to, Discourse)
+- Added scrapers for academic sources (arXiv, bioRxiv, PubMed, Semantic Scholar, ORCID, CrossRef, IACR)
+- Added scrapers for security databases (NVD, OSV, CISA KEV)
+- Added scrapers for documentation sites (MDN, Read the Docs, RFC Editor, W3C, SPDX, tldr, cheat.sh)
+- Added scrapers for media platforms (YouTube, Vimeo, Spotify, Discogs, MusicBrainz)
+- Added scrapers for AI/ML platforms (Hugging Face, Ollama)
+- Added scrapers for app stores and marketplaces (VS Code Marketplace, JetBrains Marketplace, Firefox Add-ons, Open VSX, Flathub, F-Droid, Snapcraft)
+- Added scrapers for business data (SEC EDGAR, OpenCorporates, CoinGecko)
+- Added scrapers for reference sources (Wikipedia, Wikidata, OpenLibrary, Choose a License)
+
+### Changed
+
+- Refactored web-fetch tool to use modular scraper architecture for improved maintainability
 
 ## [3.30.0] - 2026-01-07
 ### Added
