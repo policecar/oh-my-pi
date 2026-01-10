@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { Container } from "@oh-my-pi/pi-tui";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode";
 import { initTheme } from "../src/modes/interactive/theme/theme";
+import { UiHelpers } from "../src/modes/interactive/utils/ui-helpers";
 
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
@@ -19,9 +20,11 @@ describe("InteractiveMode.showStatus", () => {
 		const fakeThis: any = {
 			chatContainer: new Container(),
 			ui: { requestRender: vi.fn() },
+			isBackgrounded: false,
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
 		};
+		fakeThis.uiHelpers = new UiHelpers(fakeThis);
 
 		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_ONE");
 		expect(fakeThis.chatContainer.children).toHaveLength(2);
@@ -38,9 +41,11 @@ describe("InteractiveMode.showStatus", () => {
 		const fakeThis: any = {
 			chatContainer: new Container(),
 			ui: { requestRender: vi.fn() },
+			isBackgrounded: false,
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
 		};
+		fakeThis.uiHelpers = new UiHelpers(fakeThis);
 
 		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_ONE");
 		expect(fakeThis.chatContainer.children).toHaveLength(2);
