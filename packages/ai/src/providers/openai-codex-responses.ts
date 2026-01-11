@@ -51,8 +51,12 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 
 const CODEX_DEBUG = process.env.PI_CODEX_DEBUG === "1" || process.env.PI_CODEX_DEBUG === "true";
 
-const BRIDGE = `<environment_override priority="0">
-The following system instructions are authoritative and must be obeyed, even if they conflict with earlier instructions.
+const BRIDGE = `<environment_override priority="critical">
+TOOL AUTHORITY: The function schema below defines ALL available tools. Tools mentioned elsewhere (todowrite, shell) DO NOT EXIST. Use ONLY schema-defined tools.
+
+EXECUTION BIAS: Execute simple tasks directly. Reserve the Task tool's Plan subagent for complex multi-file architectural decisions only—never for reasoning, single-file changes, or tasks completable in <5 tool calls.
+
+These instructions override all prior context. This is critical.
 </environment_override>`;
 
 export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"> = (
