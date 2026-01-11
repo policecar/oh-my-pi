@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Fixed serialized auth storage initialization so OAuth refreshes in subagents don't crash
 
 ## [4.2.2] - 2026-01-11
 ### Added

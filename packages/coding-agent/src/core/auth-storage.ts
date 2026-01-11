@@ -15,7 +15,7 @@ import {
 	type OAuthCredentials,
 	type OAuthProvider,
 } from "@oh-my-pi/pi-ai";
-import { getAgentDbPath } from "../config";
+import { getAgentDbPath, getAuthPath } from "../config";
 import { AgentStorage } from "./agent-storage";
 import { logger } from "./logger";
 import { migrateJsonStorage } from "./storage-migration";
@@ -49,6 +49,8 @@ export interface SerializedAuthStorage {
 		}>
 	>;
 	runtimeOverrides?: Record<string, string>;
+	authPath?: string;
+	dbPath?: string;
 }
 
 /**
@@ -138,6 +140,11 @@ export class AuthStorage {
 	 */
 	static fromSerialized(data: SerializedAuthStorage): AuthStorage {
 		const instance = Object.create(AuthStorage.prototype) as AuthStorage;
+		const authPath = data.authPath ?? data.dbPath ?? getAuthPath();
+		instance.authPath = authPath;
+		instance.fallbackPaths = [];
+		instance.dbPath = data.dbPath ?? AuthStorage.resolveDbPath(authPath);
+		instance.storage = AgentStorage.open(instance.dbPath);
 		instance.data = new Map();
 		instance.runtimeOverrides = new Map();
 		instance.providerRoundRobinIndex = new Map();
@@ -186,6 +193,8 @@ export class AuthStorage {
 		return {
 			credentials,
 			runtimeOverrides: Object.keys(runtimeOverrides).length > 0 ? runtimeOverrides : undefined,
+			authPath: this.authPath,
+			dbPath: this.dbPath,
 		};
 	}
 
