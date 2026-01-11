@@ -2,6 +2,13 @@ Launch a new agent to handle complex, multi-step tasks autonomously.
 
 The Task tool launches specialized agents (workers) that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.
 
+**CRITICAL: Subagents have NO access to conversation history.** They only see:
+1. Their agent-specific system prompt
+2. The `context` string you provide
+3. The `task` string you provide
+
+If you discussed requirements, plans, schemas, or decisions with the user, you MUST include that information in `context`. Subagents cannot see prior messages - they start fresh with only what you explicitly pass them.
+
 ## Available Agents
 
 {{#list agents prefix="- " join="\n"}}
@@ -27,7 +34,7 @@ The Task tool launches specialized agents (workers) that autonomously handle com
 - **Structured completion**: If `output` is provided, subagents must call `complete` to finish
 - **Parallelize**: Launch multiple agents concurrently whenever possible
 - **Results are intermediate data**: Agent findings provide context for YOU to perform actual work. Do not treat agent reports as "task complete" signals.
-- **Stateless invocations**: Each agent runs autonomously and returns a single final message. Include all necessary context and specify exactly what information to return.
+- **Stateless invocations**: Subagents have zero memory of your conversation. Pass ALL relevant context: requirements discussed, decisions made, schemas agreed upon, file paths mentioned. If you reference something from earlier discussion without including it, the subagent will fail.
 - **Trust outputs**: Agent results should generally be trusted
 - **Clarify intent**: Tell the agent whether you expect code changes or just research (search, file reads, web fetches)
 - **Proactive use**: If an agent description says to use it proactively, do so without waiting for explicit user request
@@ -35,7 +42,7 @@ The Task tool launches specialized agents (workers) that autonomously handle com
 ## Parameters
 
 - `agent`: Agent type to use for all tasks
-- `context`: Shared context string prepended to all task prompts
+- `context`: **Required context from conversation** - include ALL relevant info: requirements, schemas, decisions, constraints. Subagents cannot see chat history.
 - `model`: (optional) Model override (fuzzy matching, e.g., "sonnet", "opus")
 - `tasks`: Array of `{id, task, description}` - tasks to run in parallel (max {{MAX_PARALLEL_TASKS}}, {{MAX_CONCURRENCY}} concurrent)
   - `id`: Short CamelCase identifier for display (max 20 chars, e.g., "SessionStore", "LspRefactor")
@@ -46,30 +53,28 @@ The Task tool launches specialized agents (workers) that autonomously handle com
 ## Example
 
 <example>
-user: "Extract all hardcoded strings for i18n"
-assistant: I'll scan UI components and return structured string locations for internationalization.
+user: "Looks good, execute the plan"
+assistant: I'll execute the refactoring plan.
 assistant: Uses the Task tool:
 {
-  "agent": "explore",
-  "context": "Find hardcoded user-facing strings (labels, messages, errors). Ignore logs, comments, and internal identifiers.",
+  "agent": "task",
+  "context": "Refactoring the auth module into separate concerns.\n\nPlan:\n1. AuthProvider - Extract React context and provider from src/auth/index.tsx\n2. AuthApi - Extract API calls to src/auth/api.ts, use existing fetchJson helper\n3. AuthTypes - Move types to src/auth/types.ts, re-export from index\n\nConstraints:\n- Preserve all existing exports from src/auth/index.tsx\n- Use project's fetchJson (src/utils/http.ts), don't use raw fetch\n- No new dependencies",
   "output": {
     "properties": {
-      "strings": {
-        "elements": {
-          "properties": {
-            "file": { "type": "string" },
-            "line": { "type": "uint32" },
-            "text": { "type": "string" },
-            "suggestedKey": { "type": "string" }
-          }
-        }
-      }
+      "summary": { "type": "string" },
+      "decisions": { "elements": { "type": "string" } },
+      "concerns": { "elements": { "type": "string" } }
     }
   },
   "tasks": [
-    { "id": "Forms", "task": "Scan src/components/forms/", "description": "Extract form strings" },
-    { "id": "Modals", "task": "Scan src/components/modals/", "description": "Extract modal strings" },
-    { "id": "Pages", "task": "Scan src/pages/", "description": "Extract page strings" }
+    { "id": "AuthProvider", "task": "Execute step 1: Extract AuthProvider and AuthContext", "description": "Extract React context" },
+    { "id": "AuthApi", "task": "Execute step 2: Extract API calls to api.ts", "description": "Extract API layer" },
+    { "id": "AuthTypes", "task": "Execute step 3: Move types to types.ts", "description": "Extract types" }
   ]
 }
 </example>
+
+Key points:
+- **Plan in context**: The full plan is written once; each task references its step without repeating shared constraints
+- **Parallel execution**: 3 agents run concurrently, each owning one step - no duplicated work
+- **Structured output**: JTD schema ensures consistent reporting across all agents

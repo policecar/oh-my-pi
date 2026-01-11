@@ -1,13 +1,14 @@
 # Changelog
 
 ## [Unreleased]
-
 ### Added
 
 - Added `planner` built-in agent for comprehensive implementation planning with slow model
 
 ### Changed
 
+- Updated Task tool documentation to emphasize that subagents have no access to conversation history and require all relevant context to be explicitly passed
+- Revised task agent prompt to clarify that subagents have full tool access and can make file edits, run commands, and create files
 - OpenAI Codex: updated to use bundled system prompt from upstream
 - Changed `complete` tool to make `data` parameter optional when aborting, while still requiring it for successful completions
 
