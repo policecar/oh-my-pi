@@ -25,7 +25,6 @@ describe("CombinedAutocompleteProvider", () => {
 
 			const result = provider.getForceFileSuggestions(lines, cursorLine, cursorCol);
 
-			console.log("Result:", result);
 			// This might return null if /A doesn't match anything, which is fine
 			// We're mainly testing that the prefix extraction works
 			if (result) {
