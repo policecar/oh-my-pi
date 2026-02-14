@@ -292,6 +292,16 @@ export const SETTINGS_SCHEMA = {
 	"compaction.keepRecentTokens": { type: "number", default: 20000 },
 	"compaction.autoContinue": { type: "boolean", default: true },
 	"compaction.remoteEndpoint": { type: "string", default: undefined },
+	"compaction.rlm": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "agent",
+			label: "RLM compaction",
+			description: "Use a Python REPL loop for compaction — the model explores and summarizes the conversation programmatically",
+		},
+	},
+	"compaction.rlmMaxIterations": { type: "number", default: 15 },
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// Branch summary settings
@@ -971,6 +981,8 @@ export interface CompactionSettings {
 	keepRecentTokens: number;
 	autoContinue: boolean;
 	remoteEndpoint: string | undefined;
+	rlm: boolean;
+	rlmMaxIterations: number;
 }
 
 export interface RetrySettings {

@@ -25,6 +25,7 @@ import {
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
 } from "./utils";
+import { rlmCompact } from "./rlm-compaction";
 
 // ============================================================================
 // File Operation Tracking
@@ -112,6 +113,10 @@ export interface CompactionSettings {
 	keepRecentTokens: number;
 	autoContinue?: boolean;
 	remoteEndpoint?: string;
+	/** Enable RLM-based compaction: the model explores the conversation via a Python REPL. */
+	rlm?: boolean;
+	/** Maximum RLM loop iterations (default: 15). */
+	rlmMaxIterations?: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
@@ -119,6 +124,8 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 	autoContinue: true,
+	rlm: false,
+	rlmMaxIterations: 15,
 };
 
 // ============================================================================
@@ -474,6 +481,12 @@ export interface SummaryOptions {
 	promptOverride?: string;
 	extraContext?: string[];
 	remoteEndpoint?: string;
+	/** Optional cheaper model for RLM sub-LLM calls */
+	leafModel?: Model;
+	/** API key for the leaf model */
+	leafApiKey?: string;
+	/** Working directory for the Python REPL (RLM mode) */
+	cwd?: string;
 }
 
 export async function generateSummary(
@@ -746,12 +759,47 @@ export async function compact(
 		promptOverride: options?.promptOverride,
 		extraContext: options?.extraContext,
 		remoteEndpoint: settings.remoteEndpoint,
+		leafModel: options?.leafModel,
+		leafApiKey: options?.leafApiKey,
+		cwd: options?.cwd,
 	};
 
 	// Generate summaries (can be parallel if both needed) and merge into one
 	let summary: string;
 
-	if (isSplitTurn && turnPrefixMessages.length > 0) {
+	// RLM path: let the model explore the conversation via a Python REPL
+	if (settings.rlm && !summaryOptions.remoteEndpoint && messagesToSummarize.length > 0) {
+		const allMessages = isSplitTurn && turnPrefixMessages.length > 0
+			? [...messagesToSummarize, ...turnPrefixMessages]
+			: messagesToSummarize;
+
+		logger.debug("Using RLM-based compaction", {
+			messageCount: allMessages.length,
+			maxIterations: settings.rlmMaxIterations ?? 15,
+		});
+
+		const rlmResult = await rlmCompact(allMessages, recentMessages, {
+			model,
+			apiKey,
+			leafModel: summaryOptions.leafModel,
+			leafApiKey: summaryOptions.leafApiKey,
+			maxIterations: settings.rlmMaxIterations ?? 15,
+			signal,
+			previousSummary,
+			customInstructions,
+			cwd: summaryOptions.cwd,
+			reserveTokens: settings.reserveTokens,
+		});
+
+		logger.debug("RLM compaction complete", {
+			iterations: rlmResult.iterations,
+			subLlmCalls: rlmResult.subLlmCalls,
+			codeBlocksExecuted: rlmResult.codeBlocksExecuted,
+			summaryLength: rlmResult.summary.length,
+		});
+
+		summary = rlmResult.summary;
+	} else if (isSplitTurn && turnPrefixMessages.length > 0) {
 		// Generate both summaries in parallel
 		const [historyResult, turnPrefixResult] = await Promise.all([
 			messagesToSummarize.length > 0
