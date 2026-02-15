@@ -2414,6 +2414,17 @@ export class AgentSession {
 				details = hookCompaction.details;
 				preserveData ??= hookCompaction.preserveData;
 			} else {
+				// Resolve leaf model for RLM sub-LLM calls
+				let leafModel: Model | undefined;
+				let leafApiKey: string | undefined;
+				if (compactionSettings.rlm) {
+					const availableModels = this.#modelRegistry.getAvailable();
+					leafModel = this.#resolveRoleModel("smol", availableModels, this.model);
+					if (leafModel) {
+						leafApiKey = (await this.#modelRegistry.getApiKey(leafModel, this.sessionId)) ?? undefined;
+					}
+				}
+
 				// Generate compaction result
 				const result = await compact(
 					preparation,
@@ -2421,7 +2432,13 @@ export class AgentSession {
 					apiKey,
 					customInstructions,
 					this.#compactionAbortController.signal,
-					{ promptOverride: hookPrompt, extraContext: hookContext },
+					{
+						promptOverride: hookPrompt,
+						extraContext: hookContext,
+						leafModel,
+						leafApiKey,
+						cwd: this.sessionManager.getCwd(),
+					},
 				);
 				summary = result.summary;
 				shortSummary = result.shortSummary;
@@ -2927,6 +2944,17 @@ Be thorough - include exact file paths, function names, error messages, and tech
 				let compactResult: CompactionResult | undefined;
 				let lastError: unknown;
 
+				// Resolve leaf model for RLM sub-LLM calls (once, outside retry loop)
+				const compactionSettings = this.settings.getGroup("compaction");
+				let leafModel: Model | undefined;
+				let leafApiKey: string | undefined;
+				if (compactionSettings.rlm) {
+					leafModel = this.#resolveRoleModel("smol", availableModels, this.model);
+					if (leafModel) {
+						leafApiKey = (await this.#modelRegistry.getApiKey(leafModel, this.sessionId)) ?? undefined;
+					}
+				}
+
 				for (const candidate of candidates) {
 					const apiKey = await this.#modelRegistry.getApiKey(candidate, this.sessionId);
 					if (!apiKey) continue;
@@ -2940,7 +2968,13 @@ Be thorough - include exact file paths, function names, error messages, and tech
 								apiKey,
 								undefined,
 								this.#autoCompactionAbortController.signal,
-								{ promptOverride: hookPrompt, extraContext: hookContext },
+								{
+									promptOverride: hookPrompt,
+									extraContext: hookContext,
+									leafModel,
+									leafApiKey,
+									cwd: this.sessionManager.getCwd(),
+								},
 							);
 							break;
 						} catch (error) {

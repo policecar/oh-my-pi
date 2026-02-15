@@ -47,6 +47,9 @@ export interface PythonExecutorOptions {
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
+	/** Async callback to handle input() requests from the kernel.
+	 *  Used by RLM compaction for llm_query IPC via stdin channel. */
+	inputProvider?: (prompt: string) => Promise<string>;
 }
 
 export interface PythonKernelExecutor {
@@ -404,6 +407,14 @@ async function disposeKernelSession(session: KernelSession): Promise<void> {
 	kernelSessions.delete(session.id);
 }
 
+/** Dispose a single kernel session by its session ID. No-op if the session doesn't exist. */
+export async function disposeKernelSessionById(sessionId: string): Promise<void> {
+	const session = kernelSessions.get(sessionId);
+	if (session) {
+		await disposeKernelSession(session);
+	}
+}
+
 async function withKernelSession<T>(
 	sessionId: string,
 	cwd: string,
@@ -474,6 +485,7 @@ async function executeWithKernel(
 			timeoutMs: options?.timeoutMs,
 			onChunk: text => sink.push(text),
 			onDisplay: output => void displayOutputs.push(output),
+			inputProvider: options?.inputProvider,
 		});
 
 		if (result.cancelled) {
