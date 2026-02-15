@@ -2,25 +2,35 @@
  * RLM-based session compaction.
  *
  * Implements the Recursive Language Models paradigm (Zhang, Kraska, Khattab —
- * arXiv 2512.24601) for session compaction. Instead of feeding the full
- * conversation into a single LLM summarization call, the conversation is
- * loaded into oh-my-pi's IPython kernel as a `context` variable. The model
- * then writes Python code to programmatically examine, search, chunk, and
- * delegate analysis to sub-LLM calls — discovering its own summarization
- * strategy rather than following a hard-coded algorithm.
+ * arXiv 2512.24601) for session compaction, following the architectural
+ * patterns from deepfates/cantrip:
+ *
+ *   1. Strict context isolation — REPL output is metadata-only in the driving
+ *      model's conversation history. Only explicit print() output is shown.
+ *   2. Forced sandbox — the model MUST use tool_use (python_repl / submit_answer).
+ *      It cannot answer without going through the REPL.
+ *   3. stdin-based IPC — llm_query() uses Python's input() which blocks while
+ *      the TypeScript host resolves the LLM call asynchronously via the Jupyter
+ *      stdin channel. No file polling.
+ *   4. Recursive sub-agents — llm_query() spawns a nested RLM agent at depth+1
+ *      with its own kernel, context, and tools. Falls back to plain LLM at
+ *      max depth.
+ *   5. Resource cleanup — try/finally for kernel disposal, token tracking across
+ *      all recursion levels.
  *
  * Architecture:
- *   - Conversation text → temp file → IPython kernel `context` variable
- *   - `llm_query(prompt)` in kernel → routes to completeSimple() with smol model
- *   - Iterative loop: model generates ```repl code → kernel executes → output fed back
- *   - Model calls FINAL(summary) when done
+ *   - Conversation text → IPython kernel `context` variable (programmatic space)
+ *   - Model calls python_repl tool → kernel executes → metadata-only result
+ *   - llm_query() in kernel → input() blocks → host resolves via inputProvider
+ *   - Model calls submit_answer tool → compaction complete
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { Model, Message } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Message, Model, Tool } from "@oh-my-pi/pi-ai";
 import { completeSimple } from "@oh-my-pi/pi-ai";
+import { Type, type Static } from "@sinclair/typebox";
 import { logger } from "@oh-my-pi/pi-utils";
 import { renderPromptTemplate } from "../../config/prompt-templates";
-import { executePython } from "../../ipy/executor";
+import { executePython, disposeKernelSessionById } from "../../ipy/executor";
 import { convertToLlm } from "../../session/messages";
 import { serializeConversation } from "./utils";
 import rlmCompactionSystemPrompt from "../../prompts/compaction/rlm-compaction-system.md" with { type: "text" };
@@ -30,7 +40,7 @@ import rlmCompactionSystemPrompt from "../../prompts/compaction/rlm-compaction-s
 // ============================================================================
 
 export interface RlmCompactionOptions {
-	/** Model that drives the RLM loop (writes REPL code, calls FINAL) */
+	/** Model that drives the RLM loop (writes REPL code, calls submit_answer) */
 	model: Model;
 	/** API key for the driving model */
 	apiKey: string;
@@ -38,7 +48,7 @@ export interface RlmCompactionOptions {
 	leafModel?: Model;
 	/** API key for the leaf model */
 	leafApiKey?: string;
-	/** Maximum iterations of the generate-code → execute → observe loop */
+	/** Maximum iterations of the tool-use loop */
 	maxIterations: number;
 	/** Abort signal */
 	signal?: AbortSignal;
@@ -50,6 +60,19 @@ export interface RlmCompactionOptions {
 	cwd?: string;
 	/** Token budget for driving model responses */
 	reserveTokens: number;
+	/** Current recursion depth (default: 0) */
+	depth?: number;
+	/** Maximum recursion depth (default: 2) */
+	maxDepth?: number;
+}
+
+/** Accumulated token usage across the driving model and all sub-LLM calls. */
+export interface RlmUsage {
+	drivingInputTokens: number;
+	drivingOutputTokens: number;
+	subLlmInputTokens: number;
+	subLlmOutputTokens: number;
+	totalCost: number;
 }
 
 export interface RlmCompactionResult {
@@ -61,27 +84,57 @@ export interface RlmCompactionResult {
 	subLlmCalls: number;
 	/** Number of code blocks executed */
 	codeBlocksExecuted: number;
+	/** Accumulated token usage */
+	usage: RlmUsage;
 }
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-/** Maximum characters of REPL output to feed back to the model per iteration */
-const MAX_OUTPUT_CHARS = 20_000;
+/** Maximum characters of print() stdout to feed back to the model per tool call */
+const MAX_PRINT_OUTPUT_CHARS = 2_000;
 
-/** Timeout for each Python cell execution (seconds) */
-const CELL_TIMEOUT_SEC = 30;
+/** Timeout for each Python cell execution (ms). Generous to allow for llm_query latency. */
+const CELL_TIMEOUT_MS = 120_000;
 
-/** Regex to find ```repl code blocks in model output.
- *  Uses a tempered greedy token to avoid matching across block boundaries. */
-const REPL_CODE_BLOCK_RE = /```repl\s*\n((?:(?!```)[\s\S])*?)\n```/g;
+// ============================================================================
+// Tool Schemas
+// ============================================================================
 
-/** Regex to find FINAL(answer) in model output */
-const FINAL_RE = /^\s*FINAL\(([\s\S]*)\)\s*$/m;
+const pythonReplSchema = Type.Object({
+	code: Type.String({ description: "Python code to execute in the REPL environment" }),
+});
 
-/** Regex to find FINAL_VAR(varname) in model output */
-const FINAL_VAR_RE = /^\s*FINAL_VAR\((\w+)\)\s*$/m;
+const submitAnswerSchema = Type.Object({
+	summary: Type.String({ description: "The final compaction summary text" }),
+	variable: Type.Optional(Type.String({
+		description: "Name of a Python variable containing the summary (alternative to summary field)",
+	})),
+});
+
+type PythonReplParams = Static<typeof pythonReplSchema>;
+type SubmitAnswerParams = Static<typeof submitAnswerSchema>;
+
+const RLM_TOOLS: Tool[] = [
+	{
+		name: "python_repl",
+		description:
+			"Execute Python code in the REPL environment. " +
+			"The REPL has a pre-loaded `context` variable (string) containing the full conversation. " +
+			"Use print() to see specific data — only printed output is shown. " +
+			"Use llm_query(prompt) to delegate semantic analysis to a sub-LLM.",
+		parameters: pythonReplSchema,
+	},
+	{
+		name: "submit_answer",
+		description:
+			"Submit the final compaction summary. You MUST explore the context via python_repl " +
+			"before calling this. Provide the summary text directly, or set `variable` to the name " +
+			"of a Python variable you built up across REPL calls.",
+		parameters: submitAnswerSchema,
+	},
+];
 
 // ============================================================================
 // System Prompt
@@ -90,41 +143,48 @@ const FINAL_VAR_RE = /^\s*FINAL_VAR\((\w+)\)\s*$/m;
 const RLM_SYSTEM_PROMPT = renderPromptTemplate(rlmCompactionSystemPrompt);
 
 // ============================================================================
-// Code Parsing
+// Metadata Formatting
 // ============================================================================
 
-interface CodeBlock {
-	code: string;
+/**
+ * Format REPL output as metadata-only (like cantrip's formatRlmMetadata).
+ * Keeps data out of the driving model's token window.
+ */
+export function formatReplMetadata(output: string): string {
+	const trimmed = output.trim();
+	if (!trimmed) return "[no output]";
+	const lines = trimmed.split("\n");
+	const preview = trimmed.slice(0, 200).replace(/\n/g, "\\n");
+	return `[${trimmed.length} chars, ${lines.length} lines] "${preview}${trimmed.length > 200 ? "..." : ""}"`;
 }
 
-export function findCodeBlocks(text: string): CodeBlock[] {
-	const blocks: CodeBlock[] = [];
-	let match: RegExpExecArray | null;
-	const re = new RegExp(REPL_CODE_BLOCK_RE.source, "g");
-	while ((match = re.exec(text)) !== null) {
-		const code = match[1].trim();
-		if (code) {
-			blocks.push({ code });
-		}
-	}
-	return blocks;
+/**
+ * Extract text from an AssistantMessage's content blocks.
+ */
+function extractText(response: AssistantMessage): string {
+	return response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map(c => c.text)
+		.join("\n");
 }
 
-export function findFinalAnswer(text: string): string | null {
-	// Check for FINAL(answer)
-	const finalMatch = FINAL_RE.exec(text);
-	if (finalMatch) {
-		return finalMatch[1].trim();
+/**
+ * Accumulate usage from a completeSimple response.
+ */
+function accumulateUsage(usage: RlmUsage, response: AssistantMessage, target: "driving" | "sub"): void {
+	const u = response.usage;
+	if (!u) return;
+	const input = u.input + u.cacheRead + u.cacheWrite;
+	const output = u.output;
+	const cost = u.cost?.total ?? 0;
+	if (target === "driving") {
+		usage.drivingInputTokens += input;
+		usage.drivingOutputTokens += output;
+	} else {
+		usage.subLlmInputTokens += input;
+		usage.subLlmOutputTokens += output;
 	}
-	return null;
-}
-
-export function findFinalVar(text: string): string | null {
-	const match = FINAL_VAR_RE.exec(text);
-	if (match) {
-		return match[1].trim();
-	}
-	return null;
+	usage.totalCost += cost;
 }
 
 // ============================================================================
@@ -134,17 +194,17 @@ export function findFinalVar(text: string): string | null {
 /**
  * Build Python setup code that:
  * 1. Loads the serialized conversation into a `context` variable
- * 2. Defines llm_query() that communicates back to the TypeScript process
- *    via a temp file protocol (since we can't inject TCP sockets into IPython)
+ * 2. Defines llm_query() using input() for stdin-based IPC — Python blocks on
+ *    input() while the TypeScript host resolves the LLM call via inputProvider.
  */
-export function buildSetupCode(contextText: string, requestFile: string, responseFile: string): string {
+export function buildSetupCode(contextText: string): string {
 	// Escape for Python triple-quoted string
 	const escaped = contextText
 		.replace(/\\/g, "\\\\")
 		.replace(/"""/g, '\\"\\"\\"');
 
 	return `
-import json, time, os
+import json
 
 # Load conversation context
 context = """${escaped}"""
@@ -153,46 +213,36 @@ context = """${escaped}"""
 context_length = len(context)
 context_lines = context.count("\\n") + 1
 
-# Request/response files for llm_query communication
-_RLM_REQUEST_FILE = ${JSON.stringify(requestFile)}
-_RLM_RESPONSE_FILE = ${JSON.stringify(responseFile)}
-
-def llm_query(prompt, model=None):
-    """Query a sub-LLM. The prompt can be up to ~500K characters.
+def llm_query(prompt, sub_context=None, model=None):
+    """Query a sub-LLM. The prompt can reference the conversation context.
+    If sub_context is provided, the child agent explores that instead.
     Returns the model's text response as a string.
     Use this to analyze chunks of context that are too large to print."""
-    request = json.dumps({"prompt": str(prompt), "model": model})
-    with open(_RLM_REQUEST_FILE, "w") as f:
-        f.write(request)
-    # Signal ready
-    with open(_RLM_REQUEST_FILE + ".ready", "w") as f:
-        f.write("1")
-    # Wait for response (poll)
-    for _ in range(600):  # 60 second timeout
-        if os.path.exists(_RLM_RESPONSE_FILE + ".ready"):
-            break
-        time.sleep(0.1)
-    else:
-        raise TimeoutError("llm_query timed out waiting for response")
-    with open(_RLM_RESPONSE_FILE, "r") as f:
-        response = json.loads(f.read())
-    # Cleanup
-    try:
-        os.remove(_RLM_RESPONSE_FILE + ".ready")
-    except OSError:
-        pass
+    request = json.dumps({
+        "type": "llm_query",
+        "prompt": str(prompt),
+        "context": sub_context,
+        "model": model,
+    })
+    response_json = input(request)
+    response = json.loads(response_json)
     if "error" in response:
         raise RuntimeError(f"llm_query failed: {response['error']}")
     return response["response"]
 
-def llm_query_batched(prompts, model=None):
-    """Query a sub-LLM with multiple prompts. Returns a list of responses."""
-    return [llm_query(p, model) for p in prompts]
+def llm_query_batched(prompts, sub_contexts=None, model=None):
+    """Query a sub-LLM with multiple prompts. Returns a list of responses.
+    Optionally pass sub_contexts (list of strings) to give each child its own data."""
+    results = []
+    for i, p in enumerate(prompts):
+        ctx = sub_contexts[i] if sub_contexts and i < len(sub_contexts) else None
+        results.append(llm_query(p, sub_context=ctx, model=model))
+    return results
 
 def SHOW_VARS():
     """Print all user-defined variables and their types/sizes."""
     for name, val in sorted(globals().items()):
-        if name.startswith("_") or callable(val) or name in ("json", "time", "os", "In", "Out"):
+        if name.startswith("_") or callable(val) or name in ("json", "In", "Out"):
             continue
         t = type(val).__name__
         if isinstance(val, str):
@@ -207,108 +257,18 @@ print(f"Context loaded: {context_length} characters, {context_lines} lines")
 }
 
 // ============================================================================
-// llm_query Handler
-// ============================================================================
-
-/**
- * Start a background polling loop that handles llm_query requests from the
- * Python kernel. Returns a handle to stop the loop and await the total count.
- *
- * This MUST run concurrently with executePython — the Python side blocks
- * inside llm_query() waiting for a response file, so the TypeScript handler
- * needs to detect and serve requests while the kernel is still executing.
- */
-function startLlmQueryHandler(
-	requestFile: string,
-	responseFile: string,
-	model: Model,
-	apiKey: string,
-	signal?: AbortSignal,
-): { stop: () => void; result: Promise<number> } {
-	let stopped = false;
-	const stop = () => { stopped = true; };
-
-	const result = (async () => {
-		let callCount = 0;
-		const readyFile = requestFile + ".ready";
-		const fs = await import("node:fs/promises");
-
-		while (!stopped && !signal?.aborted) {
-			// Check if there's a pending request
-			let hasPending = false;
-			try {
-				await fs.stat(readyFile);
-				hasPending = true;
-			} catch {
-				// No request pending — wait before polling again
-				await new Promise(r => setTimeout(r, 50));
-				continue;
-			}
-
-			if (!hasPending) continue;
-
-			// Read request
-			const requestText = await Bun.file(requestFile).text();
-			const request = JSON.parse(requestText) as { prompt: string; model?: string };
-
-			// Clean up ready signal
-			try { await fs.unlink(readyFile); } catch {}
-
-			callCount++;
-			logger.debug("RLM llm_query call", { callIndex: callCount, promptLength: request.prompt.length });
-
-			try {
-				const response = await completeSimple(
-					model,
-					{
-						messages: [{
-							role: "user",
-							content: [{ type: "text", text: request.prompt }],
-							timestamp: Date.now(),
-						}],
-					},
-					{
-						apiKey,
-						signal,
-						maxTokens: 8192,
-					},
-				);
-
-				const text = response.content
-					.filter((c): c is { type: "text"; text: string } => c.type === "text")
-					.map(c => c.text)
-					.join("\n");
-
-				await Bun.write(responseFile, JSON.stringify({ response: text }));
-			} catch (error) {
-				const msg = error instanceof Error ? error.message : String(error);
-				await Bun.write(responseFile, JSON.stringify({ error: msg }));
-			}
-
-			// Signal response ready
-			await Bun.write(responseFile + ".ready", "1");
-		}
-
-		return callCount;
-	})();
-
-	return { stop, result };
-}
-
-// ============================================================================
 // Main RLM Loop
 // ============================================================================
 
 /**
  * Run RLM-based compaction on a set of messages.
  *
- * The model is given access to a Python REPL with:
- *   - `context`: the serialized conversation text
- *   - `llm_query(prompt)`: delegates to a sub-LLM
- *   - `SHOW_VARS()`: lists variables in scope
+ * The model uses two tools:
+ *   - `python_repl`: Execute Python code in a REPL with `context` variable
+ *   - `submit_answer`: Provide the final compaction summary
  *
- * The model iteratively writes code to explore, chunk, analyze, and
- * summarize the conversation, then calls FINAL(summary) when done.
+ * The REPL provides `llm_query(prompt, sub_context?)` which spawns recursive
+ * child RLM agents (depth-limited, falling back to plain LLM at max depth).
  */
 export async function rlmCompact(
 	messagesToSummarize: AgentMessage[],
@@ -327,291 +287,380 @@ export async function rlmCompact(
 		cwd,
 		reserveTokens,
 	} = options;
+	const currentDepth = options.depth ?? 0;
+	const maxRecursionDepth = options.maxDepth ?? 2;
 
 	// Serialize conversation
-	const allMessages = [...messagesToSummarize];
-	const llmMessages = convertToLlm(allMessages);
+	const llmMessages = convertToLlm([...messagesToSummarize]);
 	const conversationText = serializeConversation(llmMessages);
 
 	// Also serialize recent messages for task context
 	const recentLlmMessages = convertToLlm(recentMessages);
 	const recentText = serializeConversation(recentLlmMessages);
 
-	// Create temp files for llm_query IPC
-	const tmpDir = await import("node:os").then(os => os.tmpdir());
+	// Kernel session for this agent level
 	const sessionId = `rlm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-	const requestFile = `${tmpDir}/${sessionId}-request.json`;
-	const responseFile = `${tmpDir}/${sessionId}-response.json`;
+	const kernelSessionId = `rlm-compaction-d${currentDepth}-${sessionId}`;
 
-	// Set up the REPL environment
-	const setupCode = buildSetupCode(conversationText, requestFile, responseFile);
-
-	logger.debug("RLM compaction: setting up REPL", {
-		contextChars: conversationText.length,
-		contextLines: conversationText.split("\n").length,
-		recentChars: recentText.length,
-	});
-
-	// Execute setup in a persistent session kernel so variables survive across iterations
-	const kernelSessionId = `rlm-compaction-${sessionId}`;
-	const setupResult = await executePython(setupCode, {
-		cwd,
-		timeoutMs: CELL_TIMEOUT_SEC * 1000,
-		signal,
-		sessionId: kernelSessionId,
-		kernelMode: "session",
-	});
-
-	if (setupResult.exitCode !== 0) {
-		throw new Error(`RLM REPL setup failed: ${setupResult.output}`);
-	}
-
-	// Build the RLM conversation for the driving model
-	const maxTokens = Math.floor(0.8 * reserveTokens);
-	// Message history for the driving model's conversation.
-	// Uses a looser type since we build assistant messages without full pi-ai fields;
-	// cast to Message[] at completeSimple() call sites.
-	const messageHistory: Array<{
-		role: "user" | "assistant";
-		content: string | Array<{ type: string; text: string }>;
-		timestamp: number;
-	}> = [];
-
-	// Build the initial user prompt
-	let taskDescription = "Summarize a coding session conversation for context compaction.";
-	if (customInstructions) {
-		taskDescription += ` Focus: ${customInstructions}`;
-	}
-
-	const contextMeta = `Your context is a str with ${conversationText.length} total characters and ${conversationText.split("\n").length} lines.`;
-	if (previousSummary) {
-		taskDescription += `\n\nThere is a previous compaction summary that should be updated/merged:\n${previousSummary}`;
-	}
-	if (recentText) {
-		taskDescription += `\n\nThe user's most recent messages (kept in context, not needing summarization) are:\n${recentText.slice(0, 2000)}`;
-	}
-
-	// Seed with context metadata (like RLM does)
-	messageHistory.push({
-		role: "assistant",
-		content: [{ type: "text", text: contextMeta }],
-		timestamp: Date.now(),
-	});
+	// Usage tracker
+	const usage: RlmUsage = {
+		drivingInputTokens: 0,
+		drivingOutputTokens: 0,
+		subLlmInputTokens: 0,
+		subLlmOutputTokens: 0,
+		totalCost: 0,
+	};
 
 	let iterations = 0;
 	let totalSubCalls = 0;
 	let totalCodeBlocks = 0;
 
-	// Use a dedicated kernel session for all iterations
-	// (setup already created variables; subsequent executePython calls reuse the session)
+	try {
+		// Set up the REPL environment
+		const setupCode = buildSetupCode(conversationText);
 
-	for (let i = 0; i < maxIterations; i++) {
-		if (signal?.aborted) {
-			throw new Error("RLM compaction aborted");
+		logger.debug("RLM compaction: setting up REPL", {
+			depth: currentDepth,
+			contextChars: conversationText.length,
+			contextLines: conversationText.split("\n").length,
+		});
+
+		const setupResult = await executePython(setupCode, {
+			cwd,
+			timeoutMs: CELL_TIMEOUT_MS,
+			signal,
+			sessionId: kernelSessionId,
+			kernelMode: "session",
+		});
+
+		if (setupResult.exitCode !== 0) {
+			throw new Error(`RLM REPL setup failed: ${setupResult.output}`);
 		}
 
-		iterations++;
+		// Sub-LLM model resolution
+		const subQueryModel = leafModel || model;
+		const subQueryApiKey = leafApiKey || apiKey;
 
-		// Build user prompt for this iteration
-		let iterPrompt: string;
-		if (i === 0) {
-			iterPrompt = `You have not interacted with the REPL environment or seen your context yet. Your next action should be to explore the context and figure out how to produce a comprehensive summary.
+		// inputProvider: handles llm_query() calls from Python's input()
+		const inputProvider = async (prompt: string): Promise<string> => {
+			let request: { type: string; prompt: string; context?: string; model?: string };
+			try {
+				request = JSON.parse(prompt);
+			} catch {
+				return JSON.stringify({ error: "Invalid request JSON" });
+			}
 
-Think step-by-step about what to do using the REPL environment (which contains the \`context\` variable) and the \`llm_query()\` function to produce your summary.
+			if (request.type !== "llm_query") {
+				return JSON.stringify({ error: `Unknown request type: ${request.type}` });
+			}
 
-Task: ${taskDescription}
+			totalSubCalls++;
 
-Continue using the REPL environment and write code in \`\`\`repl\`\`\` tags. Your next action:`;
-		} else {
-			iterPrompt = `The above is your previous interactions with the REPL environment. Think step-by-step about what to do next.
+			if (currentDepth >= maxRecursionDepth) {
+				// At max depth — fall back to plain LLM call with truncated context
+				logger.debug("RLM llm_query at max depth, using plain LLM", {
+					depth: currentDepth,
+					promptLength: request.prompt.length,
+				});
+				const truncatedPrompt = request.prompt.length > 10_000
+					? request.prompt.slice(0, 10_000) + "\n... [truncated]"
+					: request.prompt;
+				try {
+					const response = await completeSimple(
+						subQueryModel,
+						{
+							messages: [{
+								role: "user",
+								content: [{ type: "text", text: truncatedPrompt }],
+								timestamp: Date.now(),
+							}],
+						},
+						{ apiKey: subQueryApiKey, signal, maxTokens: 8192 },
+					);
+					accumulateUsage(usage, response, "sub");
+					return JSON.stringify({ response: extractText(response) });
+				} catch (error) {
+					return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
+				}
+			}
 
-Continue using the REPL environment to work toward a comprehensive summary. When you have enough information, call FINAL(your_summary) with the complete summary text.
+			// Recursive: spawn a nested RLM agent
+			logger.debug("RLM llm_query spawning child agent", {
+				depth: currentDepth + 1,
+				promptLength: request.prompt.length,
+				hasSubContext: !!request.context,
+			});
 
-Your next action:`;
+			try {
+				// Build sub-messages from the provided context (or parent context)
+				const subContextText = request.context ?? conversationText;
+				const subMessages: AgentMessage[] = [{
+					role: "user",
+					content: [{ type: "text", text: subContextText }],
+					timestamp: Date.now(),
+				}];
+
+				const childResult = await rlmCompact(subMessages, [], {
+					model: subQueryModel,
+					apiKey: subQueryApiKey,
+					leafModel,
+					leafApiKey,
+					maxIterations: Math.min(maxIterations, 8),
+					signal,
+					customInstructions: request.prompt,
+					cwd,
+					reserveTokens,
+					depth: currentDepth + 1,
+					maxDepth: maxRecursionDepth,
+				});
+
+				// Aggregate child usage
+				totalSubCalls += childResult.subLlmCalls;
+				totalCodeBlocks += childResult.codeBlocksExecuted;
+				usage.subLlmInputTokens += childResult.usage.drivingInputTokens + childResult.usage.subLlmInputTokens;
+				usage.subLlmOutputTokens += childResult.usage.drivingOutputTokens + childResult.usage.subLlmOutputTokens;
+				usage.totalCost += childResult.usage.totalCost;
+
+				return JSON.stringify({ response: childResult.summary });
+			} catch (error) {
+				return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
+			}
+		};
+
+		// Build the driving model's conversation
+		const maxTokens = Math.floor(0.8 * reserveTokens);
+		const messageHistory: Message[] = [];
+
+		// Build the initial task description
+		let taskDescription = "Summarize a coding session conversation for context compaction.";
+		if (customInstructions) {
+			taskDescription += ` Focus: ${customInstructions}`;
+		}
+		if (previousSummary) {
+			taskDescription += `\n\nThere is a previous compaction summary that should be updated/merged:\n${previousSummary}`;
+		}
+		if (recentText) {
+			taskDescription += `\n\nThe user's most recent messages (kept in context, not needing summarization) are:\n${recentText.slice(0, 2000)}`;
 		}
 
+		const contextMeta =
+			`Context: a string with ${conversationText.length} characters and ${conversationText.split("\n").length} lines. ` +
+			`Loaded in the REPL as the \`context\` variable. Explore it using the python_repl tool.`;
+
+		// Initial user message with task + metadata
 		messageHistory.push({
 			role: "user",
-			content: [{ type: "text", text: iterPrompt }],
+			content: `${contextMeta}\n\nTask: ${taskDescription}`,
 			timestamp: Date.now(),
-		});
+		} as Message);
 
-		// Call the driving model
-		const response = await completeSimple(
-			model,
-			{
-				systemPrompt: RLM_SYSTEM_PROMPT,
-				messages: messageHistory as Message[],
-			},
-			{ maxTokens, signal, apiKey, reasoning: "high" },
-		);
-
-		if (response.stopReason === "error") {
-			throw new Error(`RLM driving model failed: ${response.errorMessage || "Unknown error"}`);
-		}
-
-		const responseText = response.content
-			.filter((c): c is { type: "text"; text: string } => c.type === "text")
-			.map(c => c.text)
-			.join("\n");
-
-		// Check for FINAL answer before executing code
-		const finalAnswer = findFinalAnswer(responseText);
-		if (finalAnswer) {
-			logger.debug("RLM compaction: FINAL answer received", {
-				iteration: i + 1,
-				summaryLength: finalAnswer.length,
-			});
-			return {
-				summary: finalAnswer,
-				iterations,
-				subLlmCalls: totalSubCalls,
-				codeBlocksExecuted: totalCodeBlocks,
-			};
-		}
-
-		// Extract and execute code blocks
-		const codeBlocks = findCodeBlocks(responseText);
-
-		if (codeBlocks.length === 0) {
-			// Model didn't write code and didn't call FINAL — add response and continue
-			messageHistory.push({
-				role: "assistant",
-				content: [{ type: "text", text: responseText }],
-				timestamp: Date.now(),
-			});
-			continue;
-		}
-
-		// Add assistant response to history
-		messageHistory.push({
-			role: "assistant",
-			content: [{ type: "text", text: responseText }],
-			timestamp: Date.now(),
-		});
-
-		// Execute each code block
-		for (const block of codeBlocks) {
+		// ── Tool-use loop ──
+		for (let i = 0; i < maxIterations; i++) {
 			if (signal?.aborted) {
 				throw new Error("RLM compaction aborted");
 			}
 
-			totalCodeBlocks++;
+			iterations++;
 
-			// Start the llm_query handler BEFORE executing code.
-			// Python's llm_query() blocks waiting for a response file, so
-			// the handler must run concurrently to serve those requests.
-			const subQueryModel = leafModel || model;
-			const subQueryApiKey = leafApiKey || apiKey;
-			const handler = startLlmQueryHandler(
-				requestFile,
-				responseFile,
-				subQueryModel,
-				subQueryApiKey,
-				signal,
+			// Call the driving model with tools
+			const response = await completeSimple(
+				model,
+				{
+					systemPrompt: RLM_SYSTEM_PROMPT,
+					messages: messageHistory,
+					tools: RLM_TOOLS,
+				},
+				{ maxTokens, signal, apiKey, reasoning: "high" },
 			);
 
-			// Execute code in the persistent kernel (may call llm_query)
-			const execResult = await executePython(block.code, {
-				cwd,
-				timeoutMs: CELL_TIMEOUT_SEC * 1000,
-				signal,
-				sessionId: kernelSessionId,
-				kernelMode: "session",
-			});
+			accumulateUsage(usage, response, "driving");
 
-			// Python execution finished — stop the handler and collect stats
-			handler.stop();
-			const subCalls = await handler.result;
-			totalSubCalls += subCalls;
-
-			// Truncate output for the model
-			let output = execResult.output.trim();
-			if (output.length > MAX_OUTPUT_CHARS) {
-				output = output.slice(0, MAX_OUTPUT_CHARS) + `\n... [truncated, ${output.length - MAX_OUTPUT_CHARS} more chars]`;
+			if (response.stopReason === "error") {
+				throw new Error(`RLM driving model failed: ${response.errorMessage || "Unknown error"}`);
 			}
 
-			// Check for FINAL_VAR in the code output or model response
-			const finalVarName = findFinalVar(responseText);
-			if (finalVarName) {
-				// Retrieve the variable value
-				const retrieveResult = await executePython(`print(${finalVarName})`, {
-					cwd,
-					timeoutMs: CELL_TIMEOUT_SEC * 1000,
-					signal,
-					sessionId: kernelSessionId,
-					kernelMode: "session",
-				});
-				if (retrieveResult.exitCode === 0 && retrieveResult.output.trim()) {
+			// Add assistant message to history
+			messageHistory.push(response as Message);
+
+			// If the model didn't make tool calls, prompt it to use tools
+			if (response.stopReason !== "toolUse") {
+				messageHistory.push({
+					role: "user",
+					content: "You must use either the python_repl tool to explore the context, or the submit_answer tool to provide the final summary. Please use a tool now.",
+					timestamp: Date.now(),
+				} as Message);
+				continue;
+			}
+
+			// Process tool calls
+			const toolCalls = response.content.filter(
+				(c): c is { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> } =>
+					c.type === "toolCall",
+			);
+
+			for (const toolCall of toolCalls) {
+				if (signal?.aborted) {
+					throw new Error("RLM compaction aborted");
+				}
+
+				if (toolCall.name === "submit_answer") {
+					const args = toolCall.arguments as SubmitAnswerParams;
+					let summary = args.summary;
+
+					// If variable is specified, retrieve from kernel
+					if (args.variable) {
+						const retrieveResult = await executePython(`print(${args.variable})`, {
+							cwd,
+							timeoutMs: CELL_TIMEOUT_MS,
+							signal,
+							sessionId: kernelSessionId,
+							kernelMode: "session",
+						});
+						if (retrieveResult.exitCode === 0 && retrieveResult.output.trim()) {
+							summary = retrieveResult.output.trim();
+						}
+					}
+
+					logger.debug("RLM compaction: submit_answer received", {
+						depth: currentDepth,
+						iteration: i + 1,
+						summaryLength: summary.length,
+					});
+
 					return {
-						summary: retrieveResult.output.trim(),
+						summary,
 						iterations,
 						subLlmCalls: totalSubCalls,
 						codeBlocksExecuted: totalCodeBlocks,
+						usage,
 					};
 				}
+
+				if (toolCall.name === "python_repl") {
+					const args = toolCall.arguments as PythonReplParams;
+					totalCodeBlocks++;
+
+					// Execute code in the persistent kernel with inputProvider for llm_query IPC
+					const execResult = await executePython(args.code, {
+						cwd,
+						timeoutMs: CELL_TIMEOUT_MS,
+						signal,
+						sessionId: kernelSessionId,
+						kernelMode: "session",
+						inputProvider,
+					});
+
+					// Build tool result: metadata-only for the overall output,
+					// but include truncated print() output for the model's strategic peeks.
+					const rawOutput = execResult.output.trim();
+					let toolResultText: string;
+
+					if (!rawOutput) {
+						toolResultText = "[no output]";
+					} else if (rawOutput.length <= MAX_PRINT_OUTPUT_CHARS) {
+						// Short enough to show in full (the model's strategic print() calls)
+						toolResultText = rawOutput;
+					} else {
+						// Too long — show metadata + truncated preview
+						toolResultText =
+							`${formatReplMetadata(rawOutput)}\n\n` +
+							`Printed output (first ${MAX_PRINT_OUTPUT_CHARS} chars):\n` +
+							rawOutput.slice(0, MAX_PRINT_OUTPUT_CHARS) +
+							`\n... [${rawOutput.length - MAX_PRINT_OUTPUT_CHARS} more chars truncated]`;
+					}
+
+					if (execResult.exitCode !== 0) {
+						toolResultText += `\n\n[Exit code: ${execResult.exitCode}]`;
+					}
+
+					// Push tool result to message history
+					messageHistory.push({
+						role: "toolResult",
+						toolCallId: toolCall.id,
+						toolName: "python_repl",
+						content: [{ type: "text", text: toolResultText }],
+						isError: execResult.exitCode !== 0,
+						timestamp: Date.now(),
+					} as Message);
+				}
 			}
+		}
 
-			// Feed output back to the model
-			const statusSuffix = execResult.exitCode !== 0
-				? `\n\n[Exit code: ${execResult.exitCode}]`
-				: "";
+		// Max iterations reached — force submit_answer
+		logger.debug("RLM compaction: max iterations reached, requesting submit_answer", {
+			depth: currentDepth,
+			iterations,
+			subLlmCalls: totalSubCalls,
+		});
 
-			messageHistory.push({
-				role: "user",
-				content: [{
-					type: "text",
-					text: `Code executed:\n\`\`\`python\n${block.code}\n\`\`\`\n\nREPL output:\n${output || "(no output)"}${statusSuffix}`,
-				}],
-				timestamp: Date.now(),
+		messageHistory.push({
+			role: "user",
+			content: "You have reached the maximum number of iterations. Call submit_answer now with whatever summary you have assembled.",
+			timestamp: Date.now(),
+		} as Message);
+
+		const finalResponse = await completeSimple(
+			model,
+			{
+				systemPrompt: RLM_SYSTEM_PROMPT,
+				messages: messageHistory,
+				tools: RLM_TOOLS,
+			},
+			{ maxTokens, signal, apiKey, reasoning: "high" },
+		);
+
+		accumulateUsage(usage, finalResponse, "driving");
+
+		// Check if the model used submit_answer
+		const finalToolCalls = finalResponse.content.filter(
+			(c): c is { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> } =>
+				c.type === "toolCall",
+		);
+
+		for (const tc of finalToolCalls) {
+			if (tc.name === "submit_answer") {
+				const args = tc.arguments as SubmitAnswerParams;
+				let summary = args.summary;
+				if (args.variable) {
+					const retrieveResult = await executePython(`print(${args.variable})`, {
+						cwd,
+						timeoutMs: CELL_TIMEOUT_MS,
+						signal,
+						sessionId: kernelSessionId,
+						kernelMode: "session",
+					});
+					if (retrieveResult.exitCode === 0 && retrieveResult.output.trim()) {
+						summary = retrieveResult.output.trim();
+					}
+				}
+				return {
+					summary,
+					iterations: iterations + 1,
+					subLlmCalls: totalSubCalls,
+					codeBlocksExecuted: totalCodeBlocks,
+					usage,
+				};
+			}
+		}
+
+		// Fallback: extract text from the response
+		const fallbackText = extractText(finalResponse);
+		return {
+			summary: fallbackText || "Compaction failed: model did not submit an answer.",
+			iterations: iterations + 1,
+			subLlmCalls: totalSubCalls,
+			codeBlocksExecuted: totalCodeBlocks,
+			usage,
+		};
+	} finally {
+		// Always dispose the kernel session to free resources
+		try {
+			await disposeKernelSessionById(kernelSessionId);
+		} catch (err) {
+			logger.debug("RLM compaction: failed to dispose kernel session", {
+				sessionId: kernelSessionId,
+				error: err instanceof Error ? err.message : String(err),
 			});
 		}
 	}
-
-	// Max iterations reached — ask for a final answer
-	logger.debug("RLM compaction: max iterations reached, requesting final answer", {
-		iterations,
-		subLlmCalls: totalSubCalls,
-	});
-
-	messageHistory.push({
-		role: "user",
-		content: [{
-			type: "text",
-			text: "You have reached the maximum number of iterations. Please provide a final comprehensive summary now using FINAL(your_summary).",
-		}],
-		timestamp: Date.now(),
-	});
-
-	const finalResponse = await completeSimple(
-		model,
-		{
-			systemPrompt: RLM_SYSTEM_PROMPT,
-			messages: messageHistory as Message[],
-		},
-		{ maxTokens, signal, apiKey, reasoning: "high" },
-	);
-
-	const finalText = finalResponse.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map(c => c.text)
-		.join("\n");
-
-	const finalAnswer = findFinalAnswer(finalText);
-
-	// Cleanup temp files
-	try {
-		const fs = await import("node:fs/promises");
-		await fs.unlink(requestFile).catch(() => {});
-		await fs.unlink(responseFile).catch(() => {});
-		await fs.unlink(requestFile + ".ready").catch(() => {});
-		await fs.unlink(responseFile + ".ready").catch(() => {});
-	} catch {}
-
-	return {
-		summary: finalAnswer || finalText,
-		iterations: iterations + 1,
-		subLlmCalls: totalSubCalls,
-		codeBlocksExecuted: totalCodeBlocks,
-	};
 }

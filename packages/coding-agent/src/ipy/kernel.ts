@@ -77,6 +77,10 @@ export interface KernelExecuteOptions {
 	silent?: boolean;
 	storeHistory?: boolean;
 	allowStdin?: boolean;
+	/** Async callback to handle input() requests from the kernel.
+	 *  Receives the prompt string, returns the response string.
+	 *  When set, allowStdin is implicitly true and stdinRequested stays false. */
+	inputProvider?: (prompt: string) => Promise<string>;
 }
 
 export interface KernelExecuteResult {
@@ -633,7 +637,7 @@ export class PythonKernel {
 				silent: options?.silent ?? false,
 				store_history: options?.storeHistory ?? !(options?.silent ?? false),
 				user_expressions: {},
-				allow_stdin: options?.allowStdin ?? false,
+				allow_stdin: options?.allowStdin ?? !!options?.inputProvider,
 				stop_on_error: true,
 			},
 		};
@@ -772,26 +776,66 @@ export class PythonKernel {
 					break;
 				}
 				case "input_request": {
-					stdinRequested = true;
-					if (options?.onChunk) {
-						await options.onChunk(
-							"[stdin] Kernel requested input. Interactive stdin is not supported; provide input programmatically.\n",
-						);
+					const inputPrompt = String((response.content as { prompt?: string }).prompt ?? "");
+					if (options?.inputProvider) {
+						// Route through the provider (e.g., RLM llm_query IPC)
+						void (async () => {
+							try {
+								const value = await options.inputProvider!(inputPrompt);
+								this.#sendMessage({
+									channel: "stdin",
+									header: {
+										msg_id: Snowflake.next(),
+										session: this.sessionId,
+										username: this.username,
+										date: new Date().toISOString(),
+										msg_type: "input_reply",
+										version: "5.5",
+									},
+									parent_header: response.header as unknown as Record<string, unknown>,
+									metadata: {},
+									content: { value },
+								});
+							} catch (err) {
+								// On error, send empty reply to unblock the kernel
+								this.#sendMessage({
+									channel: "stdin",
+									header: {
+										msg_id: Snowflake.next(),
+										session: this.sessionId,
+										username: this.username,
+										date: new Date().toISOString(),
+										msg_type: "input_reply",
+										version: "5.5",
+									},
+									parent_header: response.header as unknown as Record<string, unknown>,
+									metadata: {},
+									content: { value: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }) },
+								});
+							}
+						})();
+					} else {
+						stdinRequested = true;
+						if (options?.onChunk) {
+							await options.onChunk(
+								"[stdin] Kernel requested input. Interactive stdin is not supported; provide input programmatically.\n",
+							);
+						}
+						this.#sendMessage({
+							channel: "stdin",
+							header: {
+								msg_id: Snowflake.next(),
+								session: this.sessionId,
+								username: this.username,
+								date: new Date().toISOString(),
+								msg_type: "input_reply",
+								version: "5.5",
+							},
+							parent_header: response.header as unknown as Record<string, unknown>,
+							metadata: {},
+							content: { value: "" },
+						});
 					}
-					this.#sendMessage({
-						channel: "stdin",
-						header: {
-							msg_id: Snowflake.next(),
-							session: this.sessionId,
-							username: this.username,
-							date: new Date().toISOString(),
-							msg_type: "input_reply",
-							version: "5.5",
-						},
-						parent_header: response.header as unknown as Record<string, unknown>,
-						metadata: {},
-						content: { value: "" },
-					});
 					break;
 				}
 			}
